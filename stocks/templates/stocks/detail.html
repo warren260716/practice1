@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block title %}{{ stock.stock_id }} {{ stock.name }}{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">{{ stock.stock_id }} {{ stock.name }} <small class="text-muted fs-6">{{ stock.industry }}</small></h3>
+  <div class="d-flex gap-2">
+    <a href="{% url 'stock_dividends' stock.stock_id %}" class="btn btn-outline-info">💰 近年股利細節</a>
+    <form method="post" action="{% url 'refresh_price' stock.stock_id %}">{% csrf_token %}
+      <button class="btn btn-outline-secondary">↻ 更新最新資料</button>
+    </form>
+    <form method="post" action="{% url 'toggle_favorite' stock.stock_id %}">{% csrf_token %}
+      {% if is_fav %}<button class="btn btn-warning">★ 已在我的最愛（點擊移除）</button>
+      {% else %}<button class="btn btn-outline-warning">☆ 加入我的最愛</button>{% endif %}
+    </form>
+  </div>
+</div>
+
+{% if series %}
+<div class="btn-group mb-3" id="rangeBtns">
+  <button class="btn btn-outline-primary" data-months="1">1 個月</button>
+  <button class="btn btn-outline-primary" data-months="6">6 個月</button>
+  <button class="btn btn-outline-primary active" data-months="12">1 年</button>
+  <button class="btn btn-outline-primary" data-months="36">3 年</button>
+  <button class="btn btn-outline-primary" data-months="60">5 年</button>
+</div>
+
+<div class="row g-3 mb-3" id="summary"></div>
+
+<div class="card shadow-sm mb-4"><div class="card-body">
+  <div class="d-flex justify-content-end gap-2 mb-2">
+    <button type="button" class="btn btn-sm btn-outline-secondary" id="toggleChartDetails"
+            aria-pressed="false">顯示圖表細節</button>
+    <div class="btn-group btn-group-sm" id="zoomBtns">
+      <button type="button" class="btn btn-outline-secondary" id="zoomOut" title="縮小看整體">－</button>
+      <button type="button" class="btn btn-outline-secondary" id="zoomFit" title="整體檢視">整體</button>
+      <button type="button" class="btn btn-outline-secondary" id="zoomIn" title="放大看細節">＋</button>
+    </div>
+    <div class="form-check form-switch ms-2">
+      <input class="form-check-input" type="checkbox" id="toggleKD">
+      <label class="form-check-label" for="toggleKD">顯示 KD</label>
+    </div>
+  </div>
+  <div class="chart-scroll">
+    <div id="chartWrap" class="chart-wrap">
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
+  <small class="text-muted">每日 VWAP ≈ (最高+最低+收盤)/3；錨定VWAP = Σ(每日VWAP×成交量) / Σ成交量（錨點為所選區間起點，逐日累計）；圖中亦含 MA20、MA60；可用 +／－ 按鈕或手機滑動切換整體與細節檢視</small>
+</div></div>
+
+<div class="card shadow-sm"><div class="card-body">
+  <table class="table table-sm table-striped text-end mb-2">
+    <thead><tr><th class="text-start">日期</th><th>開盤</th><th>最高</th><th>最低</th><th>收盤</th><th>成交量(張)</th><th>VWAP</th><th>MA20</th><th>MA60</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <nav class="d-flex justify-content-between align-items-center">
+    <small class="text-muted" id="pageInfo"></small>
+    <div class="btn-group btn-group-sm">
+      <button class="btn btn-outline-secondary" id="prevPage">上一頁</button>
+      <button class="btn btn-outline-secondary" id="nextPage">下一頁</button>
+    </div>
+  </nav>
+</div></div>
+{% else %}
+<div class="alert alert-warning">目前沒有股價資料（可能 API 次數已達上限，請稍後再試）。</div>
+{% endif %}
+{{ series|json_script:"series-data" }}
+{% endblock %}
+
+{% block scripts %}
+<style>
+  /* 資料點多時 chartWrap 會被 JS 撐寬，靠此容器橫向捲動放大檢視，不致擠成一團 */
+  .chart-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .chart-wrap { height: 320px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+const ALL = JSON.parse(document.getElementById('series-data').textContent);
+const PAGE_SIZE = 20;
+let rows = [], page = 0, chart = null;
+let currentData = [], pxPerPoint = 6;
+let chartDetailsEnabled = false;
+const MAX_PX_PER_POINT = 30;
+
+const fmt = (v, d = 2) => v == null ? '-' : Number(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
+
+function updateChartDetailsButton() {
+  const button = document.getElementById('toggleChartDetails');
+  button.textContent = chartDetailsEnabled ? '隱藏圖表細節' : '顯示圖表細節';
+  button.setAttribute('aria-pressed', String(chartDetailsEnabled));
+}
+
+function toggleChartDetails() {
+  chartDetailsEnabled = !chartDetailsEnabled;
+  updateChartDetailsButton();
+  if (chart) {
+    chart.options.plugins.tooltip.enabled = chartDetailsEnabled;
+    chart.update();
+  }
+}
+
+function sliceByMonths(m) {
+  if (!ALL.length) return [];
+  const end = new Date(ALL[ALL.length - 1].date);
+  const start = new Date(end); start.setMonth(start.getMonth() - m);
+  const s = start.toISOString().slice(0, 10);
+  return ALL.filter(r => r.date > s);
+}
+
+function withCumVwap(data) {
+  let pv = 0, v = 0;
+  return data.map(r => { pv += r.vwap * r.volume; v += r.volume; return {...r, cumVwap: v ? +(pv / v).toFixed(2) : null}; });
+}
+
+function renderSummary(data) {
+  const first = data[0], last = data[data.length - 1];
+  const chg = (last.close - first.close) / first.close * 100;
+  const hi = Math.max(...data.map(r => r.high)), lo = Math.min(...data.map(r => r.low));
+  const card = (t, v, cls = '') => `<div class="col-6 col-md-3"><div class="card shadow-sm"><div class="card-body py-2">
+      <div class="text-muted small">${t}</div><div class="fs-5 ${cls}">${v}</div></div></div></div>`;
+  document.getElementById('summary').innerHTML =
+    card('最新收盤 (' + last.date + ')', fmt(last.close)) +
+    card('區間漲跌幅', (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%', chg >= 0 ? 'text-danger' : 'text-success') +
+    card('區間最高 / 最低', fmt(hi) + ' / ' + fmt(lo)) +
+    card('錨定VWAP', fmt(last.cumVwap));
+}
+
+function fitPxPerPoint() {
+  const minWidth = document.querySelector('.chart-scroll').clientWidth;
+  return currentData.length ? minWidth / currentData.length : pxPerPoint;
+}
+
+function applyChartWidth() {
+  const minWidth = document.querySelector('.chart-scroll').clientWidth;
+  document.getElementById('chartWrap').style.width = Math.max(minWidth, currentData.length * pxPerPoint) + 'px';
+  if (chart) chart.resize();
+}
+
+function applyKD() {
+  if (!chart) return;
+  const on = document.getElementById('toggleKD').checked;
+  chart.data.datasets.forEach((d, i) => {
+    if (d.label === 'K值' || d.label === 'D值') chart.setDatasetVisibility(i, on);
+  });
+  chart.options.scales.y1.display = on;
+  fitPriceAxis();
+  chart.update();
+}
+
+// 依目前可見的價格類資料重設左軸範圍，KD 隱藏時不受其 0–100 影響
+function fitPriceAxis() {
+  let lo = Infinity, hi = -Infinity;
+  chart.data.datasets.forEach((d, i) => {
+    if (d.yAxisID === 'y1' || !chart.isDatasetVisible(i)) return;
+    d.data.forEach(v => { if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } });
+  });
+  if (lo === Infinity) return;
+  const pad = (hi - lo) * 0.05 || 1;
+  chart.options.scales.y.min = lo - pad;
+  chart.options.scales.y.max = hi + pad;
+}
+
+function renderChart(data) {
+  currentData = data;
+  const ds = (label, key, color, extra = {}) => ({label, data: data.map(r => r[key]), borderColor: color,
+    backgroundColor: color, borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true, ...extra});
+
+  const cfg = {
+    type: 'line',
+    data: {
+      labels: data.map(r => r.date),
+      datasets: [
+        ds('收盤價', 'close', '#0d6efd', {borderWidth: 2}),
+        ds('每日 VWAP', 'vwap', '#adb5bd', {borderDash: [3, 3]}),
+        ds('錨定VWAP', 'cumVwap', '#6f42c1', {borderWidth: 2}),
+        ds('MA20', 'ma20', '#fd7e14'),
+        ds('MA60', 'ma60', '#20c997'),
+        ds('K值', 'k', '#e83e8c', {yAxisID: 'y1', borderWidth: 1, hidden: true}),
+        ds('D值', 'd', '#0dcaf0', {yAxisID: 'y1', borderWidth: 1, hidden: true}),
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {mode: 'index', intersect: false},
+      plugins: {tooltip: {
+        enabled: chartDetailsEnabled,
+        callbacks: {label: c => `${c.dataset.label}: ${fmt(c.parsed.y)}`}
+      }},
+      scales: {
+        x: {ticks: {maxTicksLimit: 12}},
+        y: {position: 'left'},
+        y1: {display: false, position: 'right', min: 0, max: 100,
+             title: {display: true, text: 'KD'}, grid: {drawOnChartArea: false}},
+      },
+    },
+  };
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById('chart'), cfg);
+  applyKD();
+  // 每次換區間時，先以符合畫面寬度的縮放比例顯示整體走勢
+  pxPerPoint = fitPxPerPoint();
+  applyChartWidth();
+}
+
+function renderTable() {
+  const total = Math.ceil(rows.length / PAGE_SIZE);
+  const pageRows = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  document.getElementById('tbody').innerHTML = pageRows.map(r => `<tr>
+    <td class="text-start">${r.date}</td><td>${fmt(r.open)}</td><td>${fmt(r.high)}</td><td>${fmt(r.low)}</td>
+    <td><strong>${fmt(r.close)}</strong></td><td>${fmt(r.volume / 1000, 0)}</td>
+    <td>${fmt(r.vwap)}</td><td>${fmt(r.ma20)}</td><td>${fmt(r.ma60)}</td></tr>`).join('');
+  document.getElementById('pageInfo').textContent = `第 ${page + 1} / ${total} 頁，共 ${rows.length} 筆`;
+  document.getElementById('prevPage').disabled = page === 0;
+  document.getElementById('nextPage').disabled = page >= total - 1;
+}
+
+function selectRange(months) {
+  const data = withCumVwap(sliceByMonths(months));
+  if (!data.length) return;
+  renderSummary(data);
+  renderChart(data);
+  rows = data.slice().reverse();  // 表格新的在上
+  page = 0;
+  renderTable();
+}
+
+if (ALL.length) {
+  document.getElementById('toggleChartDetails').addEventListener('click', toggleChartDetails);
+  updateChartDetailsButton();
+  document.getElementById('toggleKD').addEventListener('change', applyKD);
+  document.querySelectorAll('#rangeBtns button').forEach(btn => btn.addEventListener('click', () => {
+    document.querySelectorAll('#rangeBtns button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectRange(+btn.dataset.months);
+  }));
+  document.getElementById('prevPage').onclick = () => { page--; renderTable(); };
+  document.getElementById('nextPage').onclick = () => { page++; renderTable(); };
+  document.getElementById('zoomIn').onclick = () => { pxPerPoint = Math.min(MAX_PX_PER_POINT, pxPerPoint * 1.5); applyChartWidth(); };
+  document.getElementById('zoomOut').onclick = () => { pxPerPoint = Math.max(fitPxPerPoint(), pxPerPoint / 1.5); applyChartWidth(); };
+  document.getElementById('zoomFit').onclick = () => { pxPerPoint = fitPxPerPoint(); applyChartWidth(); };
+  selectRange(12);
+}
+</script>
+{% endblock %}
